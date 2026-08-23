@@ -99,6 +99,39 @@ def transformer_config():
     )
 
 
+def test_local_hf_param_specs_cover_gated_and_expert_views():
+    logical = torch.arange(32).reshape(8, 4)
+    gated = GatedMLPMapping(
+        "decoder.mlp.linear_fc1.weight",
+        gate="model.mlp.gate_proj.weight",
+        up="model.mlp.up_proj.weight",
+    )
+    gated_specs = gated.local_hf_param_specs()
+
+    assert [spec.name for spec in gated_specs] == [
+        "model.mlp.gate_proj.weight",
+        "model.mlp.up_proj.weight",
+    ]
+    assert gated_specs[0].selected_shape(logical.shape) == torch.Size((4, 4))
+    assert torch.equal(gated_specs[0].select(logical), logical[:4])
+    assert torch.equal(gated_specs[1].select(logical), logical[4:])
+
+    down = FusedExpertMapping(
+        "decoder.mlp.experts.linear_fc2.weight3",
+        "model.mlp.experts.down_proj",
+    )
+    assert [spec.name for spec in down.local_hf_param_specs()] == ["model.mlp.experts.3.down_proj.weight"]
+
+    gate_up = FusedGatedExpertMapping(
+        "decoder.mlp.experts.linear_fc1.weight3",
+        "model.mlp.experts.gate_up_proj",
+    )
+    assert [spec.name for spec in gate_up.local_hf_param_specs()] == [
+        "model.mlp.experts.3.gate_proj.weight",
+        "model.mlp.experts.3.up_proj.weight",
+    ]
+
+
 class MockModule(torch.nn.Module):
     """A mock nn.Module for testing purposes."""
 

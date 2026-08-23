@@ -53,6 +53,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.param_mapping import (
+    LocalHFParamSpec,
     MegatronParamMapping,
 )
 from megatron.bridge.models.conversion.peft_bridge import (
@@ -181,6 +182,31 @@ class WeightConversionTask(Generic[MappingT]):
     export_hook: Optional[Callable[[str, torch.Tensor], Iterable[HFWeightTuple]]] = field(
         default=None, compare=False, repr=False
     )
+
+    @property
+    def hf_param_names(self) -> tuple[str, ...]:
+        """HF tensors required to import this Megatron parameter."""
+        hf_param = self.mapping.hf_param
+        names = (hf_param,) if isinstance(hf_param, str) else tuple(hf_param.values())
+        return tuple(dict.fromkeys(names))
+
+    def local_hf_param_specs(self) -> tuple[LocalHFParamSpec, ...]:
+        """Describe local HF views that can be transferred without collectives."""
+        return self.mapping.local_hf_param_specs(self.global_param_name)
+
+    def combine_local_hf_weights(self, weights: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Reassemble transferred local HF views into this Megatron parameter."""
+        specs = self.local_hf_param_specs()
+        if not specs:
+            raise ValueError(f"{self.param_name!r} has no local HF parameter views.")
+        if len(specs) == 1:
+            return weights[specs[0].name]
+
+        split_dims = {spec.split_dim for spec in specs}
+        if len(split_dims) != 1 or None in split_dims:
+            raise ValueError(f"{self.param_name!r} local HF views cannot be combined generically.")
+        ordered = sorted(specs, key=lambda spec: spec.split_index)
+        return torch.cat([weights[spec.name] for spec in ordered], dim=ordered[0].split_dim)
 
 
 class _HFNameSuffixMapping:
@@ -1013,6 +1039,25 @@ class MegatronModelBridge(
             hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
         return hf_weights
 
+    @staticmethod
+    def _convert_loaded_hf_weight(
+        task: WeightConversionTask,
+        hf_weights: torch.Tensor | dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Convert already-loaded HF inputs for one Bridge task."""
+        if task.megatron_module is None:
+            return None
+        return task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+
+    def convert_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Load and convert one Bridge task from an HF-style tensor mapping."""
+        hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
+        return self._convert_loaded_hf_weight(task, hf_weights)
+
     def maybe_modify_converted_hf_weight(
         self,
         task: WeightConversionTask,
@@ -1313,7 +1358,7 @@ class MegatronModelBridge(
                     _hf_import_cache[hf_param_key] = hf_weights
 
             # 2) Delegate conversion & distribution to the bridge
-            converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+            converted_weights = self._convert_loaded_hf_weight(task, hf_weights)
 
             # 3) Copy into Megatron param if this rank received a shard
             if converted_weights is not None:
@@ -1360,7 +1405,7 @@ class MegatronModelBridge(
                 # "a leaf Variable that requires grad is being used in an in-place operation."
                 with torch.no_grad():
                     task.param_weight.copy_(converted_weights)
-        self._broadcast_shared_embeddings(megatron_model)
+        self.finalize_hf_import(megatron_model)
         if use_megatron_fsdp:
             for m in original_megatron_model:
                 m.module.install_optimized_model_weights()
@@ -1821,6 +1866,13 @@ class MegatronModelBridge(
                 torch.distributed.broadcast(embd_weights, src=embd_group_ranks[0], group=embd_group)
                 if hasattr(unwrapped_model, "output_layer"):
                     unwrapped_model.output_layer.weight.data.copy_(embd_weights)
+
+    def finalize_hf_import(self, megatron_model: Union[MegatronModel, List[MegatronModel]]) -> None:
+        """Finalize tied parameters and parameter-derived caches after import."""
+        from megatron.core.resharding import refresh_module_caches
+
+        self._broadcast_shared_embeddings(megatron_model)
+        refresh_module_caches(megatron_model)
 
     def _should_skip_mtp_duplicate_embedding_export(
         self,

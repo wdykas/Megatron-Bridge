@@ -701,6 +701,12 @@ class AutoBridge(Generic[MegatronModelT]):
         self.unquantized_state_dict = getattr(bridge, "unquantized_state_dict", None)
         return model
 
+    def get_export_fp8_tasks(self, model: MegatronModelT | list[MegatronModelT]) -> list[WeightConversionTask | None]:
+        """Build physical FP8 data and scale export tasks."""
+        if not isinstance(model, list):
+            model = [model]
+        return self._model_bridge.build_export_fp8_tasks(self.hf_pretrained, model)
+
     def export_hf_weights(
         self,
         model: list[MegatronModelT],
@@ -755,7 +761,7 @@ class AutoBridge(Generic[MegatronModelT]):
                 model = [model]
             self._validate_fp8_export_config(model)
             # Use FP8 export tasks for blockwise FP8 weights
-            conversion_tasks = self._model_bridge.build_export_fp8_tasks(self.hf_pretrained, model)
+            conversion_tasks = self.get_export_fp8_tasks(model)
 
         bridge = self._model_bridge
         return bridge.stream_weights_megatron_to_hf(
@@ -2090,6 +2096,18 @@ class AutoBridge(Generic[MegatronModelT]):
             pre_trained = self._pretrained_wrapper_cls.from_pretrained(hf_path)
 
         return self._model_bridge.build_conversion_tasks(pre_trained, megatron_model)
+
+    def convert_hf_weight(
+        self,
+        task: WeightConversionTask,
+        hf_state_dict: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Convert one Bridge task from an HF-style tensor mapping."""
+        return self._model_bridge.convert_hf_weight(task, hf_state_dict)
+
+    def finalize_hf_import(self, megatron_model: MegatronModelT | list[MegatronModelT]) -> None:
+        """Finalize tied parameters and parameter-derived caches after import."""
+        self._model_bridge.finalize_hf_import(megatron_model)
 
     @property
     def transformer_config(self) -> TransformerConfig:

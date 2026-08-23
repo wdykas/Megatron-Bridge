@@ -15,6 +15,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import torch
@@ -44,6 +45,48 @@ import logging
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LocalHFParamSpec:
+    """A named HF view of a local logical Megatron parameter."""
+
+    name: str
+    split_dim: Optional[int] = None
+    split_index: int = 0
+    split_count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.split_count < 1:
+            raise ValueError("split_count must be positive.")
+        if not 0 <= self.split_index < self.split_count:
+            raise ValueError("split_index must be within split_count.")
+        if self.split_count > 1 and self.split_dim is None:
+            raise ValueError("split_dim is required when split_count is greater than one.")
+
+    def select(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Select this HF component from a logical Megatron tensor."""
+        if self.split_count == 1:
+            return tensor
+        dim = self.split_dim % tensor.ndim
+        if tensor.shape[dim] % self.split_count:
+            raise ValueError(
+                f"Cannot split dimension {dim} of shape {tuple(tensor.shape)} into {self.split_count} equal parts."
+            )
+        return torch.chunk(tensor, self.split_count, dim=dim)[self.split_index]
+
+    def selected_shape(self, shape: torch.Size) -> torch.Size:
+        """Return the shape selected from a logical Megatron tensor."""
+        if self.split_count == 1:
+            return torch.Size(shape)
+        selected = list(shape)
+        dim = self.split_dim % len(selected)
+        if selected[dim] % self.split_count:
+            raise ValueError(
+                f"Cannot split dimension {dim} of shape {tuple(shape)} into {self.split_count} equal parts."
+            )
+        selected[dim] //= self.split_count
+        return torch.Size(selected)
 
 
 def _module_uses_fsdp(megatron_module: nn.Module) -> bool:
@@ -128,6 +171,12 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         # if a param mapping class takes in modified HF weight name from maybe_modify_loaded_hf_weight,
         # allow_hf_name_mismatch should be set to True to bypass a check in `build_conversion_tasks`
         self.allow_hf_name_mismatch = False
+
+    def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+        """Describe direct local HF views available without collectives."""
+        if not isinstance(self.hf_param, str):
+            return ()
+        return (LocalHFParamSpec(self.hf_param),)
 
     def set_process_groups_from_pg_collection(self, pg_collection: Any) -> None:
         """Override snapshotted Megatron-Core globals with a ``ProcessGroupCollection``.
@@ -2623,6 +2672,13 @@ class GatedMLPMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
         """
         super().__init__(megatron_param, {"gate": gate, "up": up})
 
+    def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+        """Describe the gate and up views of the local fused projection."""
+        return (
+            LocalHFParamSpec(self.hf_param["gate"], -2, 0, 2),
+            LocalHFParamSpec(self.hf_param["up"], -2, 1, 2),
+        )
+
     def hf_to_megatron(
         self,
         hf_weights: Dict[str, torch.Tensor],
@@ -2940,6 +2996,12 @@ class FusedExpertMapping(AutoMapping):
         """Tasks sharing the same group_key are merged during export."""
         return self.hf_param
 
+    def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+        """Describe this local expert as a canonical per-expert HF weight."""
+        expert_idx = extract_expert_number_from_param(global_param_name or self.megatron_param)
+        prefix = self.hf_param.removesuffix(".down_proj")
+        return (LocalHFParamSpec(f"{prefix}.{expert_idx}.down_proj.weight"),)
+
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
         from megatron.bridge.utils.common_utils import extract_expert_number_from_param
 
@@ -2989,6 +3051,15 @@ class FusedGatedExpertMapping(AutoMapping):
     def group_key(self) -> str:
         """Tasks sharing the same group_key are merged during export."""
         return self.hf_param
+
+    def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+        """Describe canonical gate and up views for this local expert."""
+        expert_idx = extract_expert_number_from_param(global_param_name or self.megatron_param)
+        prefix = self.hf_param.removesuffix(".gate_up_proj")
+        return (
+            LocalHFParamSpec(f"{prefix}.{expert_idx}.gate_proj.weight", -2, 0, 2),
+            LocalHFParamSpec(f"{prefix}.{expert_idx}.up_proj.weight", -2, 1, 2),
+        )
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
         from megatron.bridge.utils.common_utils import extract_expert_number_from_param
