@@ -24,7 +24,7 @@ from megatron.bridge.models.conversion import model_bridge as model_bridge_modul
 from megatron.bridge.models.conversion import modelopt_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import HFWeightTuple, MegatronModelBridge, WeightConversionTask
-from megatron.bridge.models.conversion.param_mapping import AutoMapping
+from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
 
 
 class DummyBridge(MegatronModelBridge):
@@ -33,6 +33,115 @@ class DummyBridge(MegatronModelBridge):
 
     def mapping_registry(self):  # pragma: no cover - not used in tests
         return MegatronMappingRegistry()
+
+
+def test_weight_conversion_task_round_trips_local_hf_views():
+    mapping = GatedMLPMapping(
+        "decoder.mlp.linear_fc1.weight",
+        gate="model.mlp.gate_proj.weight",
+        up="model.mlp.up_proj.weight",
+    )
+    task = WeightConversionTask(
+        param_name="decoder.mlp.linear_fc1.weight",
+        global_param_name="decoder.mlp.linear_fc1.weight",
+        mapping=mapping,
+    )
+    logical = torch.arange(32).reshape(8, 4)
+    local_weights = {spec.name: spec.select(logical) for spec in task.local_hf_param_specs()}
+
+    assert task.hf_param_names == (
+        "model.mlp.gate_proj.weight",
+        "model.mlp.up_proj.weight",
+    )
+    assert torch.equal(task.combine_local_hf_weights(local_weights), logical)
+
+
+def test_stream_weights_hf_to_megatron_uses_external_state_and_bridge_preprocessing(monkeypatch):
+    bridge = DummyBridge()
+    mapping = Mock()
+    mapping.hf_param = "hf.weight"
+    mapping.hf_to_megatron.return_value = torch.ones(2)
+    task = WeightConversionTask(
+        param_name="weight",
+        global_param_name="weight",
+        mapping=mapping,
+        megatron_module=torch.nn.Module(),
+    )
+    configured_state = {"hf.weight": torch.full((2,), -1.0)}
+    external_state = {"hf.weight": torch.zeros(2)}
+    hf_pretrained = SimpleNamespace(state=configured_state)
+    preprocess = Mock(wraps=bridge.maybe_modify_loaded_hf_weight)
+    monkeypatch.setattr(bridge, "maybe_modify_loaded_hf_weight", preprocess)
+
+    converted = list(
+        bridge.stream_weights_hf_to_megatron(
+            hf_pretrained,
+            [torch.nn.Module()],
+            [task],
+            hf_state_dict=external_state,
+        )
+    )
+
+    preprocess.assert_called_once_with(task.mapping.hf_param, external_state)
+    mapping.hf_to_megatron.assert_called_once_with(external_state["hf.weight"], task.megatron_module)
+    assert len(converted) == 1
+    assert converted[0].weight is mapping.hf_to_megatron.return_value
+
+
+@pytest.mark.parametrize(
+    ("available_names", "expected_names"),
+    [
+        (
+            {"hf.weight", "hf.weight_scale_inv"},
+            ("hf.weight", "hf.weight_scale_inv"),
+        ),
+        (
+            {"hf.weight_packed", "hf.weight_scale", "hf.weight_shape"},
+            ("hf.weight_packed", "hf.weight_scale", "hf.weight_shape"),
+        ),
+        (
+            {"hf.weight_blocks", "hf.weight_scales"},
+            ("hf.weight_blocks", "hf.weight_scales"),
+        ),
+    ],
+)
+def test_get_hf_import_param_names_declares_quantized_companions(available_names, expected_names):
+    assert DummyBridge.get_hf_import_param_names("hf.weight", available_names) == expected_names
+
+
+def test_finalize_hf_import_broadcasts_tied_weights_and_refreshes_caches(
+    monkeypatch,
+):
+    bridge = DummyBridge()
+    model = [torch.nn.Sequential()]
+    broadcast = Mock()
+    refresh = Mock()
+    monkeypatch.setattr(bridge, "_broadcast_shared_embeddings", broadcast)
+    monkeypatch.setattr("megatron.core.resharding.refit._run_post_refit_hooks", refresh)
+
+    bridge.finalize_hf_import(model)
+
+    broadcast.assert_called_once_with(model)
+    refresh.assert_called_once_with(model[0])
+
+
+def test_finalize_hf_import_refreshes_parity_mamba_cache_in_place(monkeypatch):
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+    from megatron.core.transformer.module import MegatronModule
+
+    # Exercise the real parity fork hook without constructing an entire stack.
+    mixer = MambaMixer.__new__(MambaMixer)
+    MegatronModule.__init__(mixer, config=SimpleNamespace())
+    mixer.A_log = torch.nn.Parameter(torch.tensor([0.0, 1.0]))
+    mixer.register_buffer("_A_neg_exp_cache", torch.zeros(2), persistent=False)
+    mixer._A_neg_exp_cache_stale = True
+    storage = mixer._A_neg_exp_cache.data_ptr()
+    bridge = DummyBridge()
+    monkeypatch.setattr(bridge, "_broadcast_shared_embeddings", lambda models: None)
+    bridge.finalize_hf_import([mixer])
+    assert torch.equal(mixer._A_neg_exp_cache, -mixer.A_log.float().exp())
+    assert mixer._A_neg_exp_cache.data_ptr() == storage
+    assert not mixer._A_neg_exp_cache_stale
 
 
 def test_modelopt_plan_skips_unmapped_task_slot_and_keeps_later_task(monkeypatch):
